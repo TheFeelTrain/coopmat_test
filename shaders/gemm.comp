@@ -1,0 +1,257 @@
+#version 450
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_shader_16bit_storage : require
+#ifdef USE_COOPMAT
+#extension GL_KHR_cooperative_matrix : require
+#extension GL_KHR_memory_scope_semantics : require
+#endif
+
+// ============================================================================
+//  Winograd-domain GEMM micro-kernel: cooperative matrix vs plain shader.
+//
+//  This is not the full Winograd conv kernel - it is the *inner GEMM* of it,
+//  with the same shape, tiling, LDS layout, fp32 register accumulators and the
+//  same fp32 "fold" (the linear combination of 4 GEMM results that the Winograd
+//  output transform needs).  The only thing that changes between builds is how
+//  a 16x16x16 fp16 matmul with fp32 accumulation is produced:
+//
+//     -DUSE_COOPMAT : 4x coopMatMulAdd            (VK_KHR_cooperative_matrix)
+//     (default)     : dot products, fp32 accum   (plain shader, accurate)
+//     -DPLAIN_F16   : dot products, fp16 accum   (plain shader, "fast" mode)
+//
+//  Everything else - the LDS staging, the fold, the epilogue - is the same
+//  code.  So the timing difference is the matmul, nothing else.
+//
+//  Work per workgroup (2 waves x 64 lanes, exactly like our conv kernel):
+//    NCB=4 c-blocks ("k" chain, = blocks of 16 input channels)
+//    x 4 wpi x 2 kb groups, each doing 4 independent 16x16x16 matmuls
+//    = 1,048,576 MACs per workgroup.
+//  A (weights, "U") is read from global; B ("V") is staged in LDS with the
+//  same padded row stride (24) the real kernel uses.
+// ============================================================================
+
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) readonly buffer ABuf { 
+#ifdef USE_COOPMAT
+  float16_t a[];        // coopMatLoad needs an element pointer
+#else
+  f16vec2   a2[];       // 32-bit loads of 2 reduction steps (c, c+1)
+#endif
+} ab;
+layout(set = 0, binding = 1, std430) readonly buffer BBuf  { f16vec2 b2[]; } bb;
+layout(set = 0, binding = 2, std430) buffer        OutBuf { f16vec4 o4[]; } ob;
+
+layout(push_constant) uniform PC {
+  uint nslot;   // number of distinct B slots (workgroup wg reads slot wg % nslot)
+  uint pad0;
+  uint pad1;
+  uint pad2;
+} pc;
+
+#define NCB      4u            // c-blocks (k chain)
+#define NMT      4u            // matmuls per group
+#define NGROUP   8u            // 4 wpi x 2 kb
+#define WPV      16u           // V matrices per c-block
+#define VSTR     24u           // LDS row stride in fp16 (16 -> 24: no 4-way bank conflict)
+#define WP_ELEMS (16u * VSTR)  // 384 fp16 per V matrix
+#define WP_E2    (WP_ELEMS / 2u)   // 192 f16vec2 per V matrix
+#define VS2      (VSTR / 2u)       // 12 f16vec2 between two nt rows
+#define A_E2     (256u / 2u)       // 128 f16vec2 per 16x16 A matrix
+#define A_ROW2   (16u / 2u)        // 8 f16vec2 per A matrix row
+// LDS layout of a V matrix: element (c, nt) at nt*VSTR + c.  "nt-major" so a
+// pair of reduction steps is contiguous (32-bit loads), and a legal
+// ColumnMajor coop matrix layout with stride VSTR.
+
+#ifdef USE_COOPMAT
+#define MAT_A   coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA>
+#define MAT_B   coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB>
+#define MAT_C   coopmat<float,      gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>
+#define MAT_C16 coopmat<float16_t,  gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>
+shared float16_t v_lds[WPV * WP_ELEMS];       // 6144 fp16 = 12 KB
+#else
+shared f16vec2   v_lds[WPV * WP_ELEMS / 2u];  // same bytes, vector typed so loads stay 32-bit
+#endif
+
+// Fold s0/s1 into the 4 accumulators of this (wpi, kb) group, exactly like the
+// real kernel's FOLD4.  Works for coopmat and vec4 accumulators alike.
+#define FOLD4(Y00, Y01, Y10, Y11)                        \
+  if (wpi == 0u) { Y00 = Y00 + s0; Y01 = Y01 + s1; }      \
+  else if (wpi == 1u) { Y00 = Y00 + s0; Y01 = Y01 + s1; Y10 = Y10 + s0; Y11 = Y11 + s1; } \
+  else if (wpi == 2u) { Y00 = Y00 + s0; Y01 = Y01 + s1; Y10 = Y10 - s0; Y11 = Y11 - s1; } \
+  else { Y10 = Y10 - s0; Y11 = Y11 - s1; }
+
+#ifdef PLAIN_F16
+#define PLAIN_ACC(H, AL, AH, BL, BH) \
+  H.x += dot(AL, BL); H.y += dot(AL, BH); H.z += dot(AH, BL); H.w += dot(AH, BH);
+#else
+#define PLAIN_ACC(C, AL, AH, BL, BH) \
+  C.x = fma(float(AL.x), float(BL.x), fma(float(AL.y), float(BL.y), C.x)); \
+  C.y = fma(float(AL.x), float(BH.x), fma(float(AL.y), float(BH.y), C.y)); \
+  C.z = fma(float(AH.x), float(BL.x), fma(float(AH.y), float(BL.y), C.z)); \
+  C.w = fma(float(AH.x), float(BH.x), fma(float(AH.y), float(BH.y), C.w));
+#endif
+
+// One matmul's 2-reduction-step update for the plain path.
+// al/ah = A rows lr, lr+1 at reduction steps (k, k+1)
+// bl/bh = B cols lc, lc+1 at reduction steps (k, k+1)
+#define PLAIN_STEP(JJ, ACC)                                            \
+  {                                                                    \
+    const uint ao = (abase >> 1u) + (JJ) * A_E2;                       \
+    const f16vec2 al = ab.a2[ao + lr * A_ROW2 + kk];                   \
+    const f16vec2 ah = ab.a2[ao + (lr + 1u) * A_ROW2 + kk];            \
+    const uint bo = (wp0 + (JJ)) * WP_E2 + lc * VS2 + kk;              \
+    const f16vec2 bl = v_lds[bo];                                      \
+    const f16vec2 bh = v_lds[bo + VS2];                                \
+    PLAIN_ACC(ACC, al, ah, bl, bh)                                     \
+  }
+
+void main() {
+  const uint li   = gl_LocalInvocationIndex;      // 0..127
+  const uint wave = li / 64u;                     // 0..1  (one k-group per wave)
+  const uint lane = li % 64u;                     // 0..63
+  const uint wg   = gl_WorkGroupID.x;
+  const uint slot = wg % pc.nslot;
+
+  // ---- stage the 16 V matrices of this WG into LDS ----
+  // The B buffer already uses the exact LDS layout ([wp][nt][c], row stride 24
+  // fp16), so this is a straight copy - identical for every variant.
+  {
+    const uint n2  = WPV * 16u * VSTR / 2u;               // 3072 f16vec2
+    const uint src = slot * n2;
+    for (uint i = li; i < n2; i += 128u) {
+      const f16vec2 x = bb.b2[src + i];
+#ifdef USE_COOPMAT
+      v_lds[i * 2u]      = x.x;                            // float16_t LDS
+      v_lds[i * 2u + 1u] = x.y;
+#else
+      v_lds[i] = x;                                        // f16vec2 LDS
+#endif
+    }
+  }
+
+  // ---- 8 y accumulators (fp32), 4 per k-block set ----
+#ifdef USE_COOPMAT
+  MAT_C y00_0 = MAT_C(0.0f), y01_0 = MAT_C(0.0f), y10_0 = MAT_C(0.0f), y11_0 = MAT_C(0.0f);
+  MAT_C y00_1 = MAT_C(0.0f), y01_1 = MAT_C(0.0f), y10_1 = MAT_C(0.0f), y11_1 = MAT_C(0.0f);
+#else
+  // Plain path: each lane owns a 2x2 tile of every 16x16 accumulator, because
+  // the fold (s0 = C0+C1+C2, s1 = C1-C2-C3) needs all 4 matmul results for a
+  // given output element in the same lane.  vec4 = (r0c0, r0c1, r1c0, r1c1).
+  vec4 y00_0 = vec4(0.0), y01_0 = vec4(0.0), y10_0 = vec4(0.0), y11_0 = vec4(0.0);
+  vec4 y00_1 = vec4(0.0), y01_1 = vec4(0.0), y10_1 = vec4(0.0), y11_1 = vec4(0.0);
+  const uint lr = (lane / 8u) * 2u;   // output row (ko) of this lane's tile
+  const uint lc = (lane % 8u) * 2u;   // output col (nt) of this lane's tile
+#endif
+
+  barrier();  // v_lds visible
+
+  for (uint cb = 0u; cb < NCB; ++cb) {
+    for (uint wpi = 0u; wpi < 4u; ++wpi) {
+      const uint wp0 = wpi * 4u;
+
+#ifdef USE_COOPMAT
+      // B (V) is shared by the two kb groups of this wpi -> loaded once.
+      MAT_B B0, B1, B2, B3;
+      coopMatLoad(B0, v_lds, (wp0 + 0u) * WP_ELEMS, VSTR, gl_CooperativeMatrixLayoutColumnMajor);
+      coopMatLoad(B1, v_lds, (wp0 + 1u) * WP_ELEMS, VSTR, gl_CooperativeMatrixLayoutColumnMajor);
+      coopMatLoad(B2, v_lds, (wp0 + 2u) * WP_ELEMS, VSTR, gl_CooperativeMatrixLayoutColumnMajor);
+      coopMatLoad(B3, v_lds, (wp0 + 3u) * WP_ELEMS, VSTR, gl_CooperativeMatrixLayoutColumnMajor);
+#endif
+
+      for (uint kb = 0u; kb < 2u; ++kb) {
+        const uint g = wpi * 2u + kb;
+        // A layout: [wave][cb][g][j][ko][c], 256 fp16 per matrix
+        const uint abase = ((wave * (NCB * NGROUP) + cb * NGROUP + g) * NMT) * 256u;
+
+#ifdef USE_COOPMAT
+        MAT_A A0, A1, A2, A3;
+        coopMatLoad(A0, ab.a, abase + 0u * 256u, 16u, gl_CooperativeMatrixLayoutRowMajor);
+        coopMatLoad(A1, ab.a, abase + 1u * 256u, 16u, gl_CooperativeMatrixLayoutRowMajor);
+        coopMatLoad(A2, ab.a, abase + 2u * 256u, 16u, gl_CooperativeMatrixLayoutRowMajor);
+        coopMatLoad(A3, ab.a, abase + 3u * 256u, 16u, gl_CooperativeMatrixLayoutRowMajor);
+
+        MAT_C C0 = MAT_C(0.0f), C1 = MAT_C(0.0f), C2 = MAT_C(0.0f), C3 = MAT_C(0.0f);
+        C0 = coopMatMulAdd(A0, B0, C0);
+        C1 = coopMatMulAdd(A1, B1, C1);
+        C2 = coopMatMulAdd(A2, B2, C2);
+        C3 = coopMatMulAdd(A3, B3, C3);
+
+        MAT_C s0 = C0 + C1 + C2;
+        MAT_C s1 = C1 - C2 - C3;
+        if (kb == 0u) { FOLD4(y00_0, y01_0, y10_0, y11_0) }
+        else          { FOLD4(y00_1, y01_1, y10_1, y11_1) }
+#else
+        // ---- plain shader: the same 4 matmuls as dot products ----
+#ifdef PLAIN_F16
+        f16vec4 h0 = f16vec4(0.0), h1 = f16vec4(0.0), h2 = f16vec4(0.0), h3 = f16vec4(0.0);
+#else
+        vec4 h0 = vec4(0.0), h1 = vec4(0.0), h2 = vec4(0.0), h3 = vec4(0.0);
+#endif
+        for (uint k = 0u; k < 16u; k += 2u) {
+          const uint kk = k >> 1u;
+          PLAIN_STEP(0u, h0)
+          PLAIN_STEP(1u, h1)
+          PLAIN_STEP(2u, h2)
+          PLAIN_STEP(3u, h3)
+        }
+        vec4 s0 = vec4(h0) + vec4(h1) + vec4(h2);
+        vec4 s1 = vec4(h1) - vec4(h2) - vec4(h3);
+        if (kb == 0u) { FOLD4(y00_0, y01_0, y10_0, y11_0) }
+        else          { FOLD4(y00_1, y01_1, y10_1, y11_1) }
+#endif
+      }
+    }
+  }
+
+  barrier();  // all matmul work done with v_lds
+
+  // ---- stage the 8 y matrices as fp16 (ko,nt) at nt*16+ko ----
+  const uint yb = 2048u + wave * 2048u;   // fp16 element offset inside v_lds
+#ifdef USE_COOPMAT
+  coopMatStore(MAT_C16(y00_0), v_lds, yb + 0u * 256u, 16u, gl_CooperativeMatrixLayoutColumnMajor);
+  coopMatStore(MAT_C16(y01_0), v_lds, yb + 1u * 256u, 16u, gl_CooperativeMatrixLayoutColumnMajor);
+  coopMatStore(MAT_C16(y10_0), v_lds, yb + 2u * 256u, 16u, gl_CooperativeMatrixLayoutColumnMajor);
+  coopMatStore(MAT_C16(y11_0), v_lds, yb + 3u * 256u, 16u, gl_CooperativeMatrixLayoutColumnMajor);
+  coopMatStore(MAT_C16(y00_1), v_lds, yb + 4u * 256u, 16u, gl_CooperativeMatrixLayoutColumnMajor);
+  coopMatStore(MAT_C16(y01_1), v_lds, yb + 5u * 256u, 16u, gl_CooperativeMatrixLayoutColumnMajor);
+  coopMatStore(MAT_C16(y10_1), v_lds, yb + 6u * 256u, 16u, gl_CooperativeMatrixLayoutColumnMajor);
+  coopMatStore(MAT_C16(y11_1), v_lds, yb + 7u * 256u, 16u, gl_CooperativeMatrixLayoutColumnMajor);
+#else
+  // 2x2 tile -> 2x f16vec2 per y matrix (two adjacent ko per store)
+  {
+    const uint yh = yb / 2u + (lc * 16u + lr) / 2u;
+    const vec4 ys[8] = vec4[8](y00_0, y01_0, y10_0, y11_0, y00_1, y01_1, y10_1, y11_1);
+    for (uint j = 0u; j < 8u; ++j) {
+      const uint yj = yh + j * 128u;
+      v_lds[yj]      = f16vec2(float16_t(ys[j].x), float16_t(ys[j].z));
+      v_lds[yj + 8u] = f16vec2(float16_t(ys[j].y), float16_t(ys[j].w));
+    }
+  }
+#endif
+  barrier();
+
+  // ---- epilogue: read back 4 consecutive ko per pixel, store fp16x4 ----
+  // same shape as the real kernel's writeback.
+  {
+    const uint nt  = lane / 4u;    // 16 nt
+    const uint k4  = lane % 4u;    // 4 channel groups of 4
+    const uint ko0 = k4 * 4u;
+    for (uint kb = 0u; kb < 2u; ++kb) {
+      const uint ybase = yb + (kb * 4u) * 256u;
+      const uint ko = wave * 32u + kb * 16u + ko0;
+      for (uint px = 0u; px < 4u; ++px) {
+        const uint off = ybase + px * 256u + nt * 16u + ko0;
+        f16vec4 val;
+#ifdef USE_COOPMAT
+        val = f16vec4(v_lds[off + 0u], v_lds[off + 1u], v_lds[off + 2u], v_lds[off + 3u]);
+#else
+        const f16vec2 p0 = v_lds[off / 2u], p1 = v_lds[off / 2u + 1u];
+        val = f16vec4(p0.x, p0.y, p1.x, p1.y);
+#endif
+        // out layout: [wg][nt][px][64 ko]
+        ob.o4[((wg * 16u + nt) * 4u + px) * 16u + ko / 4u] = val;
+      }
+    }
+  }
+}
