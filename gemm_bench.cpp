@@ -66,7 +66,7 @@ static float h2f(uint16_t h) {
   return f;
 }
 
-// These values match shaders/gemm.comp.
+// These values match gemm.comp.
 static constexpr uint32_t kNCB = 4;     // k blocks
 static constexpr uint32_t kNGroup = 8;  // 4 tile groups x 2 k groups
 static constexpr uint32_t kNMT = 4;     // multiplies per group

@@ -94,7 +94,7 @@ move around between runs, so the best time is the one to trust.
 
 | file | what it is |
 |---|---|
-| `shaders/gemm.comp` | the kernel. `USE_COOPMAT` and `PLAIN_F16` pick the multiply. The rest is shared. |
+| `gemm.comp` | the kernel. `USE_COOPMAT` and `PLAIN_F16` pick the multiply. The rest is shared. |
 | `gemm_bench.cpp` | host code. Sets up Vulkan, times each dispatch, checks answers. |
 | `vk_bench.h` | small Vulkan setup helpers. No extra deps besides Vulkan. |
 | `results.txt` | output from the last `run.sh`. |
