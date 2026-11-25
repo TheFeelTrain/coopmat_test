@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Runs the comparison three times (GPU clocks wander between runs on RDNA3;
-# always look at the "min ms" column, and only trust numbers from an idle GPU).
+# Run the test three times. GPU clocks drift, so use the best time.
+# Run on a quiet GPU with nothing else using it.
 set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")"
 GRID="${GRID:-8192}"

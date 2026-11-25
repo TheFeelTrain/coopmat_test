@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
-# Builds the three shader variants + the benchmark harness.
+# Build the three shader versions and the test program.
 set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")"
 mkdir -p build
 GLSLC="${GLSLC:-glslc}"
 CXX="${CXX:-g++}"
 
-# The matmul is the ONLY difference between these three builds.
+# Only the multiply changes between these three.
 "${GLSLC}" -O --target-env=vulkan1.3 -DUSE_COOPMAT shaders/gemm.comp -o build/gemm_coop.spv
 "${GLSLC}" -O --target-env=vulkan1.3               shaders/gemm.comp -o build/gemm_f32.spv
 "${GLSLC}" -O --target-env=vulkan1.3 -DPLAIN_F16   shaders/gemm.comp -o build/gemm_f16.spv

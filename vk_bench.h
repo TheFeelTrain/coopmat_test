@@ -1,5 +1,5 @@
-// Minimal headless Vulkan-1.4 compute harness (no dependency beyond libvulkan).
-// Used by the cooperative-matrix vs plain-shader micro-benchmark.
+// Small Vulkan setup for a headless compute test.
+// Needs only libvulkan. No window, no swapchain.
 #pragma once
 
 #include <vulkan/vulkan.h>
@@ -12,14 +12,13 @@
 #include <string>
 #include <vector>
 
-#define VKB_CHECK(x)                                                                  \
-  do {                                                                               \
-    VkResult _r = (x);                                                               \
-    if (_r != VK_SUCCESS) {                                                          \
-      std::fprintf(stderr, "[vk] %s -> VkResult %d at %s:%d\n", #x, (int)_r,          \
-                   __FILE__, __LINE__);                                              \
-      std::exit(2);                                                                  \
-    }                                                                                \
+#define VKB_CHECK(x) \
+  do { \
+    VkResult _r = (x); \
+    if (_r != VK_SUCCESS) { \
+      std::fprintf(stderr, "[vk] %s failed with %d at %s:%d\n", #x, (int)_r, __FILE__, __LINE__); \
+      std::exit(2); \
+    } \
   } while (0)
 
 struct VkBuf {
@@ -32,7 +31,6 @@ struct VkBuf {
 struct VkBench {
   VkInstance instance = VK_NULL_HANDLE;
   VkPhysicalDevice physical = VK_NULL_HANDLE;
-  VkPhysicalDeviceProperties props{};
   VkDevice device = VK_NULL_HANDLE;
   VkQueue queue = VK_NULL_HANDLE;
   uint32_t queue_family = 0;
@@ -40,17 +38,15 @@ struct VkBench {
   VkCommandBuffer cmd = VK_NULL_HANDLE;
   VkFence fence = VK_NULL_HANDLE;
   VkPhysicalDeviceMemoryProperties mem_props{};
-  uint32_t timestamp_valid_bits = 0;
   float timestamp_period = 1.0f;
   bool has_coopmat = false;
+  std::vector<VkDescriptorPool> pools;
 
-  // ---------------------------------------------------------------- init ----
-  void init(bool need_coopmat, const char* device_name_filter = nullptr) {
+  void init() {
     VkApplicationInfo app{};
     app.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO;
     app.pApplicationName = "coopmat-micro";
     app.applicationVersion = 1;
-    app.pEngineName = "none";
     app.apiVersion = VK_API_VERSION_1_4;
 
     VkInstanceCreateInfo ici{};
@@ -63,52 +59,43 @@ struct VkBench {
     std::vector<VkPhysicalDevice> devs(n);
     VKB_CHECK(vkEnumeratePhysicalDevices(instance, &n, devs.data()));
 
+    // Pick a discrete GPU if there is one. Skip software rendering.
     physical = VK_NULL_HANDLE;
     for (VkPhysicalDevice d : devs) {
       VkPhysicalDeviceProperties p{};
       vkGetPhysicalDeviceProperties(d, &p);
-      bool coop = has_device_ext(d, VK_KHR_COOPERATIVE_MATRIX_EXTENSION_NAME);
-      const bool name_ok = (device_name_filter == nullptr) ||
-                           (std::strstr(p.deviceName, device_name_filter) != nullptr);
-      // Prefer a discrete GPU that has cooperative matrix; never pick llvmpipe.
-      const bool discrete = (p.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU);
-      if (name_ok && discrete && (!need_coopmat || coop)) {
+      if (p.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU) {
         physical = d;
         break;
       }
-      if (physical == VK_NULL_HANDLE && name_ok && p.deviceType != VK_PHYSICAL_DEVICE_TYPE_CPU &&
-          (!need_coopmat || coop)) {
-        physical = d;
+    }
+    if (physical == VK_NULL_HANDLE) {
+      for (VkPhysicalDevice d : devs) {
+        VkPhysicalDeviceProperties p{};
+        vkGetPhysicalDeviceProperties(d, &p);
+        if (p.deviceType != VK_PHYSICAL_DEVICE_TYPE_CPU) {
+          physical = d;
+          break;
+        }
       }
     }
     if (physical == VK_NULL_HANDLE) {
-      std::fprintf(stderr, "[vk] no suitable physical device (coopmat=%d)\n", (int)need_coopmat);
+      std::fprintf(stderr, "[vk] no usable GPU found\n");
       std::exit(2);
     }
-    vkGetPhysicalDeviceProperties(physical, &props);
     vkGetPhysicalDeviceMemoryProperties(physical, &mem_props);
     has_coopmat = has_device_ext(physical, VK_KHR_COOPERATIVE_MATRIX_EXTENSION_NAME);
 
-    // queue family with compute
+    // Find a compute queue.
     uint32_t qn = 0;
     vkGetPhysicalDeviceQueueFamilyProperties(physical, &qn, nullptr);
     std::vector<VkQueueFamilyProperties> qs(qn);
     vkGetPhysicalDeviceQueueFamilyProperties(physical, &qn, qs.data());
     queue_family = UINT32_MAX;
     for (uint32_t i = 0; i < qn; ++i) {
-      if ((qs[i].queueFlags & VK_QUEUE_COMPUTE_BIT) && (qs[i].queueFlags & VK_QUEUE_TRANSFER_BIT)) {
+      if (qs[i].queueFlags & VK_QUEUE_COMPUTE_BIT) {
         queue_family = i;
-        timestamp_valid_bits = qs[i].timestampValidBits;
         break;
-      }
-    }
-    if (queue_family == UINT32_MAX) {
-      for (uint32_t i = 0; i < qn; ++i) {
-        if (qs[i].queueFlags & VK_QUEUE_COMPUTE_BIT) {
-          queue_family = i;
-          timestamp_valid_bits = qs[i].timestampValidBits;
-          break;
-        }
       }
     }
     if (queue_family == UINT32_MAX) {
@@ -116,7 +103,7 @@ struct VkBench {
       std::exit(2);
     }
 
-    // ---- features ----
+    // Ask for fp16 storage, fp16 math, and fixed 64 wide subgroups.
     VkPhysicalDeviceVulkan11Features f11{};
     f11.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES;
     f11.storageBuffer16BitAccess = VK_TRUE;
@@ -140,8 +127,8 @@ struct VkBench {
     f13.pNext = &fcoop;
 
     std::vector<const char*> exts;
-    if (need_coopmat || has_coopmat) exts.push_back(VK_KHR_COOPERATIVE_MATRIX_EXTENSION_NAME);
     exts.push_back(VK_EXT_SUBGROUP_SIZE_CONTROL_EXTENSION_NAME);
+    if (has_coopmat) exts.push_back(VK_KHR_COOPERATIVE_MATRIX_EXTENSION_NAME);
 
     const float prio = 1.0f;
     VkDeviceQueueCreateInfo qci{};
@@ -177,46 +164,30 @@ struct VkBench {
     fci.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
     VKB_CHECK(vkCreateFence(device, &fci, nullptr, &fence));
 
-    VkPhysicalDeviceProperties p{};
-    vkGetPhysicalDeviceProperties(physical, &p);
-    timestamp_period = p.limits.timestampPeriod;
+    VkPhysicalDeviceProperties props{};
+    vkGetPhysicalDeviceProperties(physical, &props);
+    timestamp_period = props.limits.timestampPeriod;
 
-    // report cooperative matrix configs
+    // Print the card and the matrix forms it supports.
     if (has_coopmat) {
-      auto props_khr = query_coop_props();
-      std::printf("[vk] %s | %s | Vulkan %u.%u.%u\n", p.deviceName,
-                  driver_name(physical).c_str(), VK_API_VERSION_MAJOR(p.apiVersion),
-                  VK_API_VERSION_MINOR(p.apiVersion), VK_API_VERSION_PATCH(p.apiVersion));
-      std::printf("[vk] VK_KHR_cooperative_matrix configs (%zu):\n", props_khr.size());
-      for (const auto& c : props_khr) {
+      std::printf("[vk] %s\n", props.deviceName);
+      auto list = query_coop_props();
+      std::printf("[vk] coop matrix forms (%zu):\n", list.size());
+      for (const auto& c : list) {
         if (c.scope == VK_SCOPE_SUBGROUP_KHR) {
-          std::printf("       %ux%ux%u A=%d B=%d C=%d R=%d scope=subgroup%s%s\n", c.MSize,
-                      c.NSize, c.KSize, (int)c.AType, (int)c.BType, (int)c.CType,
-                      (int)c.ResultType,
-                      (c.MSize == 16 && c.NSize == 16 && c.KSize == 16 &&
+          bool want = (c.MSize == 16 && c.NSize == 16 && c.KSize == 16 &&
                        c.AType == VK_COMPONENT_TYPE_FLOAT16_KHR &&
-                       c.CType == VK_COMPONENT_TYPE_FLOAT32_KHR) ? "   <== 16x16x16 fp16->fp32"
-                                                                 : "",
-                      "");
+                       c.CType == VK_COMPONENT_TYPE_FLOAT32_KHR);
+          std::printf("       %ux%ux%u A=%d B=%d C=%d R=%d scope=subgroup%s\n", c.MSize,
+                      c.NSize, c.KSize, (int)c.AType, (int)c.BType, (int)c.CType,
+                      (int)c.ResultType, want ? "   <== used here" : "");
         }
       }
     } else {
-      std::printf("[vk] %s | %s | NO VK_KHR_cooperative_matrix\n", p.deviceName,
-                  driver_name(physical).c_str());
+      std::printf("[vk] %s | NO coop matrix support\n", props.deviceName);
     }
-    std::printf("[vk] timestampPeriod=%.3f ns, validBits=%u\n", timestamp_period,
-                timestamp_valid_bits);
+    std::printf("[vk] timestamp period %.3f ns\n", timestamp_period);
     std::fflush(stdout);
-  }
-
-  static std::string driver_name(VkPhysicalDevice d) {
-    VkPhysicalDeviceDriverProperties dp{};
-    dp.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES;
-    VkPhysicalDeviceProperties2 p2{};
-    p2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2;
-    p2.pNext = &dp;
-    vkGetPhysicalDeviceProperties2(d, &p2);
-    return std::string(dp.driverName) + " " + dp.driverInfo;
   }
 
   std::vector<VkCooperativeMatrixPropertiesKHR> query_coop_props() {
@@ -225,27 +196,28 @@ struct VkBench {
     auto fn = (PFN_vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR)vkGetInstanceProcAddr(
         instance, "vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR");
     if (!fn) return out;
-    uint32_t n = 0;
-    fn(physical, &n, nullptr);
-    if (n == 0) return out;
-    out.resize(n);
+    uint32_t count = 0;
+    fn(physical, &count, nullptr);
+    if (count == 0) return out;
+    out.resize(count);
     for (auto& p : out) p.sType = VK_STRUCTURE_TYPE_COOPERATIVE_MATRIX_PROPERTIES_KHR;
-    fn(physical, &n, out.data());
-    out.resize(n);
+    fn(physical, &count, out.data());
+    out.resize(count);
     return out;
   }
 
   static bool has_device_ext(VkPhysicalDevice d, const char* name) {
-    uint32_t n = 0;
-    vkEnumerateDeviceExtensionProperties(d, nullptr, &n, nullptr);
-    std::vector<VkExtensionProperties> e(n);
-    vkEnumerateDeviceExtensionProperties(d, nullptr, &n, e.data());
+    uint32_t count = 0;
+    vkEnumerateDeviceExtensionProperties(d, nullptr, &count, nullptr);
+    std::vector<VkExtensionProperties> e(count);
+    vkEnumerateDeviceExtensionProperties(d, nullptr, &count, e.data());
     for (auto& x : e)
       if (std::strcmp(x.extensionName, name) == 0) return true;
     return false;
   }
 
-  // ------------------------------------------------------------- buffers ----
+  // Buffers.
+
   uint32_t find_mem_type(uint32_t mask, VkMemoryPropertyFlags want) {
     for (uint32_t i = 0; i < mem_props.memoryTypeCount; ++i) {
       if ((mask & (1u << i)) && (mem_props.memoryTypes[i].propertyFlags & want) == want)
@@ -261,7 +233,6 @@ struct VkBench {
     bci.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
     bci.size = size;
     bci.usage = usage;
-    bci.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
     VKB_CHECK(vkCreateBuffer(device, &bci, nullptr, &b.buffer));
     VkMemoryRequirements req{};
     vkGetBufferMemoryRequirements(device, b.buffer, &req);
@@ -270,7 +241,8 @@ struct VkBench {
                                         VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)
                                      : VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
     uint32_t mt = find_mem_type(req.memoryTypeBits, want);
-    if (mt == UINT32_MAX && host_visible) mt = find_mem_type(req.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT);
+    if (mt == UINT32_MAX && host_visible)
+      mt = find_mem_type(req.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT);
     if (mt == UINT32_MAX) {
       std::fprintf(stderr, "[vk] no memory type\n");
       std::exit(2);
@@ -292,11 +264,11 @@ struct VkBench {
     b = VkBuf{};
   }
 
-  void begin_cmd(bool one_time = true) {
+  void begin_cmd() {
     VKB_CHECK(vkResetCommandBuffer(cmd, 0));
     VkCommandBufferBeginInfo bi{};
     bi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
-    bi.flags = one_time ? VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT : 0;
+    bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
     VKB_CHECK(vkBeginCommandBuffer(cmd, &bi));
   }
 
@@ -322,8 +294,6 @@ struct VkBench {
     bar.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
     bar.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
     bar.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
-    bar.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    bar.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
     bar.buffer = dst.buffer;
     bar.offset = 0;
     bar.size = size;
@@ -344,7 +314,8 @@ struct VkBench {
     destroy_buffer(stage);
   }
 
-  // ------------------------------------------------------------- shaders ----
+  // Shaders and pipes.
+
   VkShaderModule load_shader(const char* path) {
     FILE* f = std::fopen(path, "rb");
     if (!f) {
@@ -403,28 +374,39 @@ struct VkBench {
   }
 
   VkPipeline make_pipeline(VkShaderModule mod, VkPipelineLayout layout,
-                           uint32_t required_subgroup_size) {
+                           uint32_t subgroup_size) {
     VkPipelineShaderStageRequiredSubgroupSizeCreateInfo ssc{};
     ssc.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO;
-    ssc.requiredSubgroupSize = required_subgroup_size;
+    ssc.requiredSubgroupSize = subgroup_size;
     VkComputePipelineCreateInfo ci{};
     ci.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
     ci.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
     ci.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
     ci.stage.module = mod;
     ci.stage.pName = "main";
-    if (required_subgroup_size) ci.stage.pNext = &ssc;
+    if (subgroup_size) ci.stage.pNext = &ssc;
     ci.layout = layout;
     VkPipeline p = VK_NULL_HANDLE;
     VkResult r = vkCreateComputePipelines(device, VK_NULL_HANDLE, 1, &ci, nullptr, &p);
     if (r != VK_SUCCESS) {
-      std::fprintf(stderr, "[vk] pipeline creation failed (%d) - variant not supported here\n", (int)r);
+      std::fprintf(stderr, "[vk] pipe setup failed (%d), skipping this file\n", (int)r);
       return VK_NULL_HANDLE;
     }
     return p;
   }
 
-  VkDescriptorSet alloc_set(VkDescriptorSetLayout layout, VkDescriptorPool pool) {
+  VkDescriptorSet alloc_set(VkDescriptorSetLayout layout) {
+    VkDescriptorPoolSize psz{};
+    psz.type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    psz.descriptorCount = 3;
+    VkDescriptorPoolCreateInfo pci{};
+    pci.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
+    pci.maxSets = 1;
+    pci.poolSizeCount = 1;
+    pci.pPoolSizes = &psz;
+    VkDescriptorPool pool = VK_NULL_HANDLE;
+    VKB_CHECK(vkCreateDescriptorPool(device, &pci, nullptr, &pool));
+    pools.push_back(pool);
     VkDescriptorSetAllocateInfo ai{};
     ai.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
     ai.descriptorPool = pool;
@@ -452,11 +434,11 @@ struct VkBench {
     vkUpdateDescriptorSets(device, (uint32_t)w.size(), w.data(), 0, nullptr);
   }
 
-  // -------------------------------------------------------------- timing ----
-  // Returns per-dispatch GPU time in ms (timestamps around each dispatch).
+  // Time one dispatch many times. Returns ms for each timed run.
+  // The first `warmup` runs are dropped.
   std::vector<double> time_dispatches(VkPipeline pipe, VkPipelineLayout layout, VkDescriptorSet set,
                                       const void* push, uint32_t push_size, uint32_t gx, int iters,
-                                      int warmup, uint32_t gy = 1, uint32_t gz = 1) {
+                                      int warmup) {
     const int total = iters + warmup;
     VkQueryPoolCreateInfo qci{};
     qci.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO;
@@ -473,7 +455,7 @@ struct VkBench {
       vkCmdPushConstants(cmd, layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, push_size, push);
     for (int i = 0; i < total; ++i) {
       vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, qp, (uint32_t)(2 * i));
-      vkCmdDispatch(cmd, gx, gy, gz);
+      vkCmdDispatch(cmd, gx, 1, 1);
       vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, qp, (uint32_t)(2 * i + 1));
     }
     VKB_CHECK(vkEndCommandBuffer(cmd));

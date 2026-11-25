@@ -1,136 +1,117 @@
-# Does VK_KHR_cooperative_matrix actually win? (RDNA3, fp16 GEMM with fp32 accumulate)
+# Cooperative matrix micro test
 
-A ~300-line reproducer for the thing we disagree about.  Same kernel, three
-builds of the same source, only the 16x16x16 matmul differs:
+This is a small test to show that `VK_KHR_cooperative_matrix` is faster
+than a plain shader for fp16 matrix multiply with fp32 accumulate.
 
-| build | matmul |
+It builds the same shader three ways. Only the 16x16x16 multiply changes.
+The rest of the code is the same in all three.
+
+| build | how it does the multiply |
 |---|---|
-| `gemm_coop` | 4x `coopMatMulAdd` (VK_KHR_cooperative_matrix, fp16 in / **fp32** accumulate) |
-| `gemm_f32`  | dot products, **fp32** accumulate (the numerically equivalent plain shader) |
-| `gemm_f16`  | dot products, **fp16** accumulate (the fastest plain shader, but 3x the error) |
+| `gemm_coop` | `coopMatMulAdd`, fp16 in, fp32 accumulate |
+| `gemm_f32` | plain dot products, fp32 accumulate |
+| `gemm_f16` | plain dot products, fp16 accumulate |
 
-Everything else is identical source: same workgroup shape (2 waves x 64 lanes),
-same LDS staging, same padded LDS stride, same fp32 Winograd-style "fold", same
-epilogue, same dispatch.
+`gemm_coop` and `gemm_f32` give the same answers. `gemm_f16` is less
+accurate but is included to show that even the fast plain form loses.
 
 ## Results
 
-Radeon RX 7900 XTX (RADV NAVI31, gfx1100), Mesa 26.3.0-devel, glslc 2026.4.
-17.2 GFLOP per dispatch, grid = 8192 workgroups, per-dispatch GPU timestamps,
-300 priming dispatches before measuring.  Three runs, `min ms` per run:
+Test card: Radeon RX 7900 XTX, RADV, Mesa 26.3.0-devel.
 
-| variant | min ms, best run | TFLOP/s | % of fp16 peak¹ | max err vs fp64 CPU ref | rms err |
+Each dispatch is 17.2 GFLOP. 8192 workgroups. Times are per dispatch
+on the GPU. 300 warmup dispatches run before timing starts.
+
+| test | best time | speed | share of fp16 peak | max error | rms error |
 |---|---|---|---|---|---|
-| `gemm_coop` | **0.339** (other runs .339 / .340) | 50.7 | 44.8% | 7.8e-3 | 1.7e-3 |
-| `gemm_f32`  | **0.920** (other runs .921 / .922) | 18.7 | 16.5% | 7.8e-3 | 1.7e-3 |
-| `gemm_f16`  | **0.800** (other runs .800 / .801) | 21.5 | 19.0% | 2.3e-2 | 5.2e-3 |
+| `gemm_coop` | 0.335 ms | 51.3 TFLOPS | 45.3 percent | 7.8e-03 | 1.7e-03 |
+| `gemm_f32` | 0.924 ms | 18.6 TFLOPS | 16.4 percent | 7.8e-03 | 1.7e-03 |
+| `gemm_f16` | 0.800 ms | 21.5 TFLOPS | 19.0 percent | 2.3e-02 | 5.2e-03 |
 
-¹ 113.2 TFLOP/s = fp16 nameplate of the 7900 XTX at its 2.30 GHz max clock
-(96 CU x 128 lanes x 2 MAC/lane/clk x 2).  `--peak` lets you override it.
+Peak used here is 113.2 TFLOPS, which is the rated fp16 speed of a
+7900 XTX at 2.30 GHz. You can pass `--peak` to set your own card value.
 
-**Speedups: coop vs plain-fp32-acc = 2.72x, coop vs plain-fp16-acc = 2.36x.**
-The fp32-accumulate ones are the apples-to-apples pair (identical error, both
-match a double-precision CPU reference to the same 7.8e-3, which is just the
-fp16 output rounding).  `gemm_f16` gives up 3x the accuracy and still loses.
+Coop is 2.7x faster than plain with the same accuracy, and 2.4x faster
+than plain with lower accuracy. Errors are checked against a
+double precision CPU result. The small error that is left is just
+fp16 output rounding.
 
-## Why the gap is that large (and why it is not a strawman)
+## Why plain is slower here
 
-1. **fp32 accumulation has no packed form on RDNA3.**  `v_wmma_f32_16x16x16_f16`
-   does 4096 MACs per issue at the full fp16 rate (that is why the WMMA roof is
-   the same ~123 TFLOP/s as packed fp16).  A plain shader accumulating into f32
-   needs one `v_fma_mix_f32` per MAC, i.e. one instruction per MAC, so its
-   hard ceiling is *half* the fp16 peak.  The only 2-MAC-per-instruction
-   fp16 path that accumulates in f32 is `v_dot2_f32_f16`, and GLSL cannot
-   express it (a `f16vec2` `dot()` has an fp16 result, so it compiles to
-   `v_dot2_f16_f16`).
+On RDNA3 the fast matrix path does 4096 MACs per step at full fp16
+speed with fp32 accumulate. A plain shader that keeps fp32 accumulate
+needs one instruction per MAC, so its limit is half that. There is a
+packed dot instruction that does two per step, but plain GLSL cannot
+use it with fp32 accumulate.
 
-2. **The Winograd fold pins the plain shader to 2x2 per-lane tiles.**  The fold
-   is `s0 = C0+C1+C2`, `s1 = C1-C2-C3` followed by adds/subtracts into four f32
-   accumulators.  All four 16x16 GEMM results for a given output element must be
-   in the same lane.  With 64 lanes and a 16x16 output that leaves exactly 4
-   output elements per lane, i.e. a 2x2 tile, and a 2x2 tile with 4 independent
-   matmuls needs 4 operand loads per 8 MACs - half of the plain shader's issue
-   slots go to loads, so it lands at ~1 MAC/instruction even in fp16-accumulate
-   mode.  (The `coopmat` path has no such constraint: the 16x16 identity lives
-   in the lane layout, so `FOLD4` is just element-wise math on accumulators.)
+The test also folds four 16x16 results together after the multiply.
+That fold needs all four results for one output point in the same
+lane. On the plain path that leaves 4 outputs per lane, in a 2x2
+block. With blocks that small, half the steps are loads instead of
+math. The coop path does not have this limit because the matrix
+layout is spread across the lanes.
 
-   A 4x4-tile plain variant with the fold moved into LDS was analyzed: it halves
-   the loads (64 vs 128 per group) but adds 4 LDS stores + 2 barriers + ~32 LDS
-   ops per group, i.e. roughly a wash, which is why it is not here.
+Links:
 
-3. The absolute numbers agree with that model.  `coop` runs at 44% of the fp16
-   peak, i.e. ~55% of its own issue budget is the matmul and the rest is the
-   fold + fragment loads - which is why the production kernel (V transform,
-   strip loads and writeback added) sits around 42% of peak.  `gemm_f32` reaches
-   33% of even its own 1-MAC/instruction ceiling: 128 operand loads per 256 FMAs
-   plus L2 latency at 5 workgroups/CU (LDS-limited) is what eats the rest.  The
-   plain path is not a strawman with a silly tiling - it is stuck behind fp32
-   accumulation and the fold, and both of those are this kernel's design.
+- https://hipfire.dev/learn/rdna-wmma/
+- https://gpuopen.com/learn/wmma_on_rdna3/
+- https://www.phoronix.com/news/RADV-VK_KHR_cooperative_matrix
 
-## Why testing this on RDNA2 cannot show a win
-
-RDNA2 (`gfx1030`) has **no matrix unit** - it tops out at `v_dot4`/`v_dot2`
-packed dot products.  WMMA (`v_wmma_f32_16x16x16_f16`) arrived with RDNA3
-(`gfx1100`), and RADV's `VK_KHR_cooperative_matrix` support is built on those
-RDNA3+ WMMA instructions.  On RDNA2 there is nothing for the extension to map
-to, so any synthetic test there measures a fallback, not cooperative matrices.
-If the RDNA2 test happened to run at all, it was not measuring the same thing
-this benchmark measures.
-
-References:
-- <https://hipfire.dev/learn/rdna-wmma/> - "RDNA2 gfx1030: v_dot4 / v_dot2 (packed DOT, **no WMMA**)", RDNA3 16x16x16 WMMA, WMMA roof ~123 TF vs dot2 roof.
-- <https://gpuopen.com/learn/wmma_on_rdna3/> - WMMA is an RDNA3 feature.
-- <https://www.phoronix.com/news/RADV-VK_KHR_cooperative_matrix> - RADV coop matrix "relies on WMMA instructions ... found with RDNA3 GPUs and newer".
-
-The extension is genuinely awkward, and we work around two RADV bugs in the
-real kernel (wave32 `coopMatStore` misplacement, `coopMatLoad` of B from global
-for the upper fragment half) - but awkward is not the same as slow on hardware
-that has the matrix unit.
-
-## Build / run
+## Build and run
 
 ```sh
-./build.sh     # glslc x3 + g++ (needs libvulkan + vulkan headers only)
-./run.sh       # 3 runs of all three variants
-# or explicitly:
+./build.sh
+./run.sh
+```
+
+`build.sh` needs `glslc`, `g++`, and the Vulkan headers and library.
+Nothing else.
+
+To run by hand:
+
+```sh
 ./build/gemm_bench --grid 8192 build/gemm_coop.spv build/gemm_f32.spv build/gemm_f16.spv
 ```
 
-Exit behaviour on other hardware: the device list and the available
-coop-matrix configurations are printed first; if `VK_KHR_cooperative_matrix` (or
-the 16x16x16 fp16->fp32 config) is missing, the coop variant is skipped with a
-message and the plain ones still run.  Use `--peak <TFLOPS>` to fix the % of
-peak column for another GPU.
+Options:
 
 ```
---grid N     workgroup count (default 8192 = 17.2 GFLOP)
---iters N    timed dispatches per variant (default 40)
---slots N    distinct B slots in the input buffer (default 64)
---peak F     peak TFLOP/s used for the % column (default 113.2)
+--grid N     workgroup count (default 8192)
+--iters N    timed runs per test (default 40)
+--slots N    distinct B inputs to cycle through (default 64)
+--peak F     peak TFLOPS used for the percent column (default 113.2)
 ```
+
+If the card or driver has no `VK_KHR_cooperative_matrix`, or no
+16x16x16 fp16 to fp32 form, the coop test is skipped and the plain
+tests still run. The card name and the list of supported matrix
+forms print first.
+
+Run it three times on a quiet GPU and take the best time. Clocks
+move around between runs, so the best time is the one to trust.
 
 ## Files
 
-| file | what |
+| file | what it is |
 |---|---|
-| `shaders/gemm.comp` | the whole kernel.  `#ifdef USE_COOPMAT` / `#ifdef PLAIN_F16` select the matmul; the fold, staging and epilogue are shared code. |
-| `gemm_bench.cpp` | headless Vulkan harness: buffers, dispatch, GPU timestamps, fp64 CPU reference, fp16 helpers. |
-| `vk_bench.h` | minimal Vulkan 1.4 compute helpers. |
-| `results.txt` | raw output of the last `run.sh`. |
+| `shaders/gemm.comp` | the kernel. `USE_COOPMAT` and `PLAIN_F16` pick the multiply. The rest is shared. |
+| `gemm_bench.cpp` | host code. Sets up Vulkan, times each dispatch, checks answers. |
+| `vk_bench.h` | small Vulkan setup helpers. No extra deps besides Vulkan. |
+| `results.txt` | output from the last `run.sh`. |
 
-## Workload details (so you can sanity-check the shape)
+## What the test does
 
-Per workgroup, exactly the inner GEMM of our Winograd F(2x2,3x3) conv kernel:
+Each workgroup does 1,048,576 MACs:
 
-- 4 "c-blocks" (the k chain, 16 input channels each) x 4 wpi x 2 kb groups
-  x 4 independent 16x16x16 matmuls = **1,048,576 MACs**
-- A ("U" weights) read from global, 128 KB total, L2-resident, same layout as
-  the real kernel.  B ("V") staged into 12 KB of LDS with the real kernel's
-  padded row stride of 24 fp16, read by `coopMatLoad` ColumnMajor / by
-  `f16vec2` pairs for the plain path (same bytes, same LDS footprint).
-  ColumnMajor was measured faster than RowMajor for this B fragment load in
-  this layout, so the coop variant is not being handicapped by it.
-- The fold, the 8 fp32 accumulator matrices (4 per kb set) and the fp16
-  `ColumnMajor` y-staging + vec4 writeback of the real kernel's epilogue are
-  reproduced, minus the V transform and the bias/silu (identical work for all
-  three variants, and they only dilute the ratio).
+- 4 blocks along k, each 16 deep
+- times 4 tile groups times 2 k groups
+- times 4 separate 16x16x16 multiplies
+
+Input A comes from global memory. Input B is copied to local memory
+first with a row stride of 24 fp16 values. The stride of 24 avoids
+local memory bank conflicts. Both plain and coop paths read the same
+bytes.
+
+After the multiplies, the four results are added and subtracted
+together into 8 fp32 sums. Those sums are stored as fp16 and written
+out as fp16x4. All three builds do this part the same way.

@@ -1,13 +1,8 @@
-// Cooperative matrix (VK_KHR_cooperative_matrix) vs plain shader: Winograd-domain
-// fp16 GEMM micro-benchmark.  Headless, single file, ~no dependencies.
+// Coop vs plain shader test.
+// Usage: gemm_bench [--grid N] [--iters N] [--slots N] [--peak F] a.spv [b.spv ...]
 //
-//   ./gemm_bench [--grid N] [--iters N] variant.spv [variant.spv ...]
-//
-// For each SPIR-V module it dispatches the same workload (grid x 1,048,576 MACs),
-// times each dispatch with GPU timestamps, and finally prints:
-//   - ms per dispatch (min / median) and effective TFLOP/s
-//   - max |error| vs a double-precision CPU reference (WGs 0..3)
-//   - max |diff| vs the first variant (all 64 dumped WGs) - i.e. numerics check
+// Each input runs the same work (grid x 1,048,576 MACs). For each one it
+// prints time per dispatch, TFLOPS, and error against a CPU result.
 #include "vk_bench.h"
 
 #include <cmath>
@@ -18,7 +13,7 @@
 #include <string>
 #include <vector>
 
-// ---------------------------------------------------------------- fp16 bits ---
+// Float to half and back. Used to make test data and check results.
 static uint16_t f2h(float f) {
   uint32_t x;
   std::memcpy(&x, &f, 4);
@@ -71,31 +66,30 @@ static float h2f(uint16_t h) {
   return f;
 }
 
-// -------------------------------------------------------------- workload def ---
-// MUST match shaders/gemm.comp
-static constexpr uint32_t kNCB = 4;      // c-blocks (k chain)
-static constexpr uint32_t kNGroup = 8;   // groups per c-block (4 wpi x 2 kb)
-static constexpr uint32_t kNMT = 4;      // matmuls per group
-static constexpr uint32_t kWPV = 16;     // V matrices per c-block
-static constexpr uint32_t kVSTR = 24;    // LDS row stride in fp16
+// These values match shaders/gemm.comp.
+static constexpr uint32_t kNCB = 4;     // k blocks
+static constexpr uint32_t kNGroup = 8;  // 4 tile groups x 2 k groups
+static constexpr uint32_t kNMT = 4;     // multiplies per group
+static constexpr uint32_t kWPV = 16;    // B matrices per k block
+static constexpr uint32_t kVSTR = 24;   // B row stride in fp16
 static constexpr uint32_t kSlotElems = kWPV * 16 * kVSTR;  // 6144 fp16 per B slot
 static constexpr uint32_t kOutPerWG = 4096;  // fp16 values written per workgroup
-// per WORKGROUP (2 waves, each wave runs the full k-chain)
+// MACs per workgroup: 2 waves, each runs the full k chain.
 static constexpr uint64_t kMacPerWG = 2ull * (uint64_t)kNCB * kNGroup * kNMT * 16 * 16 * 16;
 
-// A: [wave][cb][g][j][ko][c]  (2*4*8*4*256 fp16 = 128 KB)
+// A has [wave][block][group][j][ko][c], 2*4*8*4*256 fp16 = 128 KB.
 static constexpr uint32_t kAElems = 2 * kNCB * kNGroup * kNMT * 256;
 
 struct VariantResult {
   std::string name;
   std::vector<double> ms;
-  std::vector<uint16_t> out64;  // first 64 WGs
+  std::vector<uint16_t> out64;  // first 64 workgroups
   double max_err_cpu = 0.0;
   double rms_err_cpu = 0.0;
   double max_diff_ref = 0.0;
 };
 
-// CPU reference for one (wg, wave): reproduces the shader's fold exactly.
+// CPU check for one (workgroup, wave). Follows the shader math exactly.
 static void cpu_reference(const std::vector<float>& A, const std::vector<float>& B, uint32_t nslot,
                           uint32_t wg, uint32_t wave, double y[2][4][16][16]) {
   const uint32_t slot = wg % nslot;
@@ -127,7 +121,7 @@ static void cpu_reference(const std::vector<float>& A, const std::vector<float>&
             s0[ko][nt] = c[0][ko][nt] + c[1][ko][nt] + c[2][ko][nt];
             s1[ko][nt] = c[1][ko][nt] - c[2][ko][nt] - c[3][ko][nt];
           }
-        // same if-chain as the shader's FOLD4
+        // Same fold as the shader.
         for (uint32_t ko = 0; ko < 16; ++ko)
           for (uint32_t nt = 0; nt < 16; ++nt) {
             if (wpi == 0) {
@@ -156,7 +150,7 @@ static void cpu_reference(const std::vector<float>& A, const std::vector<float>&
 int main(int argc, char** argv) {
   int grid = 8192, iters = 40, warmup = 25;
   uint32_t nslot = 64;
-  double peak_tflops = 113.2;   // 7900 XTX fp16 peak at its 2.30 GHz max clock
+  double peak_tflops = 113.2;  // 7900 XTX fp16 speed at 2.30 GHz
   std::vector<std::string> spvs;
 
   for (int i = 1; i < argc; ++i) {
@@ -178,9 +172,9 @@ int main(int argc, char** argv) {
   }
 
   VkBench vk;
-  vk.init(/*need_coopmat=*/false);
+  vk.init();
 
-  // ---------------- buffers / data ----------------
+  // Make test data. Values are in [-1, 1).
   const VkDeviceSize a_bytes = (VkDeviceSize)kAElems * 2;
   const VkDeviceSize b_bytes = (VkDeviceSize)nslot * kSlotElems * 2;
   const VkDeviceSize o_bytes = (VkDeviceSize)grid * kOutPerWG * 2;
@@ -195,7 +189,7 @@ int main(int argc, char** argv) {
     return rng;
   };
   for (size_t i = 0; i < Ah.size(); ++i) {
-    const float f = ((float)(next() >> 40) / (float)(1 << 24) - 0.5f) * 2.0f;  // [-1,1)
+    const float f = ((float)(next() >> 40) / (float)(1 << 24) - 0.5f) * 2.0f;
     Ah[i] = f2h(f);
     Af[i] = h2f(Ah[i]);
   }
@@ -214,17 +208,7 @@ int main(int argc, char** argv) {
   VkDescriptorSetLayout set_layout = vk.make_set_layout(3);
   VkPipelineLayout pipe_layout = vk.make_pipeline_layout(set_layout, 16);
 
-  VkDescriptorPoolSize psz{};
-  psz.type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-  psz.descriptorCount = 3;
-  VkDescriptorPoolCreateInfo pci{};
-  pci.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
-  pci.maxSets = 1;
-  pci.poolSizeCount = 1;
-  pci.pPoolSizes = &psz;
-  VkDescriptorPool pool = VK_NULL_HANDLE;
-  VKB_CHECK(vkCreateDescriptorPool(vk.device, &pci, nullptr, &pool));
-  VkDescriptorSet set = vk.alloc_set(set_layout, pool);
+  VkDescriptorSet set = vk.alloc_set(set_layout);
   std::vector<VkBuf*> bufs = {&bufA, &bufB, &bufO};
   vk.bind_buffers(set, bufs);
 
@@ -232,7 +216,7 @@ int main(int argc, char** argv) {
     uint32_t nslot, pad0, pad1, pad2;
   } pc{nslot, 0, 0, 0};
 
-  // ---------------- run each variant ----------------
+  // Run each input file.
   std::vector<VariantResult> results;
   const uint32_t dump_wgs = 64;
   std::vector<uint16_t> host_out64((size_t)dump_wgs * kOutPerWG);
@@ -247,12 +231,11 @@ int main(int argc, char** argv) {
       vkDestroyShaderModule(vk.device, mod, nullptr);
       continue;
     }
-    // Prime the GPU clock/power state with a throwaway batch before measuring
-    // (RDNA3 idles at ~500 MHz and takes >100 ms to reach its boost state).
+    // Warm up first so GPU clocks settle before timing.
     vk.time_dispatches(pipe, pipe_layout, set, &pc, sizeof(pc), (uint32_t)grid, 1, 300);
     r.ms = vk.time_dispatches(pipe, pipe_layout, set, &pc, sizeof(pc), (uint32_t)grid, iters,
                               warmup);
-    // read back the first 64 WGs
+    // Copy back the first 64 workgroups for the CPU check.
     VkBuf bufSmall = vk.create_buffer((VkDeviceSize)host_out64.size() * 2,
                                       VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
                                       false);
@@ -269,7 +252,7 @@ int main(int argc, char** argv) {
     vkDestroyShaderModule(vk.device, mod, nullptr);
   }
 
-  // ---------------- CPU reference check (WGs 0..3, both waves) ----------------
+  // Check workgroups 0..3, both waves, against the CPU result.
   for (auto& r : results) {
     double max_err = 0.0, sum_sq = 0.0;
     size_t cnt = 0;
@@ -296,7 +279,7 @@ int main(int argc, char** argv) {
     r.rms_err_cpu = std::sqrt(sum_sq / (double)cnt);
   }
 
-  // ---------------- pairwise diff vs the first variant ----------------
+  // Largest change from the first input, over all 64 workgroups.
   for (size_t i = 0; i < results.size(); ++i) {
     double md = 0.0;
     for (size_t k = 0; k < results[i].out64.size(); ++k) {
@@ -306,11 +289,11 @@ int main(int argc, char** argv) {
     results[i].max_diff_ref = md;
   }
 
-  // ---------------- report ----------------
+  // Print the table.
   const double macs = (double)grid * (double)kMacPerWG;
   const double flops = 2.0 * macs;
   std::printf("\n");
-  std::printf("workload: grid=%d WGs x %llu MACs = %.3f GMAC (%.3f GFLOP), %d iters\n", grid,
+  std::printf("workload: grid=%d x %llu MACs = %.3f GMAC (%.3f GFLOP), %d iters\n", grid,
               (unsigned long long)kMacPerWG, macs / 1e9, flops / 1e9, iters);
   std::printf("%-34s %9s %9s %9s %8s %8s %10s %10s\n", "variant", "min ms", "med ms", "TFLOPS",
               "%peak", "maxerr", "rms", "maxdiff");
@@ -326,8 +309,8 @@ int main(int argc, char** argv) {
                 r.max_err_cpu, r.rms_err_cpu, r.max_diff_ref);
   }
   std::printf("\n");
-  std::printf("maxerr/rms = deviation from a double-precision CPU reference (WGs 0..3, both waves)\n");
-  std::printf("maxdiff    = max |value - variant[0] value| over 64 WGs\n");
+  std::printf("maxerr/rms = error vs double precision CPU check (workgroups 0..3, both waves)\n");
+  std::printf("maxdiff    = largest change vs the first input, over 64 workgroups\n");
   std::fflush(stdout);
   return 0;
 }
